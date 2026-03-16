@@ -59,15 +59,17 @@ type cacheEntry struct {
 type TTLCache struct {
 	mu       sync.Mutex
 	items    map[string]*cacheEntry
+	k        int // max evictions per cleanup cycle
 	h        expiryHeap
 	ttl      time.Duration
 	stopChan chan struct{}
 }
 
-func NewTTLCache(ttl, cleanupInterval time.Duration) *TTLCache {
+func NewTTLCache(k int, ttl, cleanupInterval time.Duration) *TTLCache {
 	c := &TTLCache{
 		items:    make(map[string]*cacheEntry),
 		h:        expiryHeap{},
+		k:        k,
 		ttl:      ttl,
 		stopChan: make(chan struct{}),
 	}
@@ -134,14 +136,14 @@ func (c *TTLCache) removeKey(key string) {
 // deleteExpired pops at most k expired entries from the heap.
 // Holding the lock only long enough to drain the k oldest entries
 // avoids a full map scan and caps the critical section.
-func (c *TTLCache) deleteExpired(k int) {
+func (c *TTLCache) deleteExpired() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := time.Now()
 	removed := 0
 
-	for c.h.Len() > 0 && removed < k {
+	for c.h.Len() > 0 && removed < c.k {
 		top := c.h[0] // peek — O(1)
 		if now.Before(top.expiresAt) {
 			break // everything else expires later — heap guarantee
@@ -154,14 +156,13 @@ func (c *TTLCache) deleteExpired(k int) {
 
 // startCleanup ticks and evicts at most k expired entries per cycle.
 func (c *TTLCache) startCleanup(interval time.Duration) {
-	const k = 100 // tune: max evictions per tick
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			c.deleteExpired(k)
+			c.deleteExpired()
 		case <-c.stopChan:
 			return
 		}
