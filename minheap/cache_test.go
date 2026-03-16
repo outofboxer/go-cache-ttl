@@ -13,7 +13,7 @@ import (
 // -------------------------------------------------------
 
 func TestTTLCache_MinHeap(t *testing.T) {
-	cache := minheap.NewTTLCache(2*time.Second, 500*time.Millisecond)
+	cache := minheap.NewTTLCache(100, 2*time.Second, 500*time.Millisecond)
 	defer cache.Stop()
 
 	// Populate
