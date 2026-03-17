@@ -1,274 +1,263 @@
-# Min-Heap TTL Cache — Performance Analysis
-### 1 Goroutine / 8 vCPU AWS (c6i.2xlarge) / 32 GB RAM / 1 KB Values
+# Min-Heap TTL Cache in Go
+### More metadata, more write-path work, far better expiration control
+
+This document analyzes the heap-based TTL cache implementation from `minheap/cache.go`.
 
 ---
 
-## AWS Instance Baseline
+## Implementation
 
-| Property | Value |
-|---|---|
-| vCPUs | 8 (c6i.2xlarge / m6i.2xlarge) |
-| L1 cache | 48 KB per core |
-| L2 cache | 1.25 MB per core |
-| L3 cache | 30–40 MB shared |
-| Memory bandwidth | ~50 GB/s (DDR4-3200) |
-| Core clock | ~3.5 GHz base / ~3.9 GHz boost |
+The optimized version keeps two structures in sync:
 
----
-
-## Memory Layout Per Entry
-
-```
-cacheEntry struct (heap version):
-├── value     any        →  16 bytes (interface header) + 1024 bytes (payload)
-├── expiresAt time.Time  →  24 bytes
-└── heapNode  *heapEntry →   8 bytes   ← cross-pointer to heap node
-                            ---------
-                             48 bytes  (was 40 in unoptimized)
-
-heapEntry struct:
-├── key       string     →  16 bytes
-├── expiresAt time.Time  →  24 bytes
-└── index     int        →   8 bytes
-                            ---------
-                             48 bytes
-
-map[string]*cacheEntry overhead:
-├── map bucket overhead  →   8 bytes
-├── string key header    →  16 bytes
-├── string key data      →  16 bytes avg
-└── *cacheEntry pointer  →   8 bytes
-
-Total per entry          → 1,184 bytes  ≈ 1.16 KB
-```
-
-> No heap exists in the unoptimized version — these 48 bytes of `heapEntry` are the only capacity cost of the optimization.
-
----
-
-## Capacity at 32 GB
-
-```
-32 GB × 0.75 usable  =  24 GB
-24 GB / 1,184 bytes  =  ~21.4M entries
-```
-
-Working number: **~21M entries** (~3% fewer than unoptimized).
-
----
-
-## Operation Latencies — Single Goroutine
-
-With 1 goroutine there is no mutex contention. Lock cost is a single uncontested atomic CAS (~5–8 ns).
-
-### Get
-
-```
-sync.Mutex.Lock()   (uncontested CAS)  →   5–8 ns
-map lookup                             →  40–60 ns
-time.Now() + compare                   →  10 ns
-sync.Mutex.Unlock()                    →   5 ns
-──────────────────────────────────────────────────
-total                                  →  60–85 ns
-```
-
-### Set — New Key
-
-```
-sync.Mutex.Lock()                      →   5–8 ns
-map insert                             →  80–120 ns
-heap.Push  O(log 21M) = ~25 levels     →  50–80 ns
-1 KB malloc                            →  50–100 ns
-sync.Mutex.Unlock()                    →   5 ns
-──────────────────────────────────────────────────
-total                                  →  190–313 ns
-```
-
-### Set — Existing Key Update
-
-```
-sync.Mutex.Lock()                      →   5–8 ns
-map lookup                             →  40–60 ns
-update expiresAt in struct + heap node →   5 ns
-heap.Fix  O(log 21M) = ~25 levels      →  50–80 ns
-sync.Mutex.Unlock()                    →   5 ns
-──────────────────────────────────────────────────
-total                                  →  105–158 ns   ← faster than new insert
-```
-
-### Heap Depth at 21M Entries
-
-```
-log₂(21,000,000)  =  ~24.3  →  ~25 levels per heap op
-
-Top levels (1–4)   → permanently hot in L1 cache
-Bottom levels      → occasional L3 miss
-Heap array layout  → flat []*heapEntry slice, sequential memory,
-                     prefetcher-friendly vs random map bucket traversal
-```
-
----
-
-## Throughput — Single Goroutine
-
-| Operation | Best | Avg | Worst |
-|---|---|---|---|
-| Get | ~16.6M/s | ~13M/s | ~11M/s |
-| Set new | ~5.2M/s | ~3.7M/s | ~3.2M/s |
-| Set update | ~9.5M/s | ~7.1M/s | — |
-| 80/20 read/write (new keys) | ~13M/s | ~10.5M/s | — |
-| 80/20 read/write (updates) | ~14.5M/s | ~11.5M/s | — |
-
----
-
-## Cleanup Cycle Performance
-
-### deleteExpired(k=100, interval=100ms)
-
-```
-100 × heap.Pop:
-  each Pop  →  O(log 21M) = ~25 comparisons
-  100 Pops  →  2,500 comparisons × ~5 ns  =  ~12.5 µs
-  map delete per entry  →  ~5 ns × 100   =    0.5 µs
-  ───────────────────────────────────────────────────
-  total lock hold       →  ~13–15 µs
-```
-
-### deleteExpired(k=50K, interval=100ms) — recommended
-
-```
-50K × heap.Pop  →  50K × 25 comparisons × 5 ns  =  ~6.25 ms lock hold
-```
-
-### Eviction Rate vs Expiry Rate
-
-```
-Expiry rate at 21M entries, TTL=60s:
-  21M / 60s  =  350K entries expire per second
-
-k=100,  interval=100ms  →     1,000 evictions/sec   ✗  falling 350× behind
-k=50K,  interval=100ms  →   500,000 evictions/sec   ✓  keeping up comfortably
-k=500K, interval=100ms  → 5,000,000 evictions/sec   ✓  large headroom
-```
-
-### Recommended Config
+1. a map for ordinary key lookups
+2. a min-heap ordered by expiration time
 
 ```go
-NewTTLCache(
-    60*time.Second,        // TTL
-    100*time.Millisecond,  // cleanup interval
-    50_000,                // k per tick → ~6ms lock hold
-)
+type heapEntry struct {
+key       string
+expiresAt time.Time
+index     int
+}
+
+type cacheEntry struct {
+value     any
+expiresAt time.Time
+heapNode  *heapEntry
+}
+
+type TTLCache struct {
+mu       sync.Mutex
+items    map[string]*cacheEntry
+k        int
+h        expiryHeap
+ttl      time.Duration
+stopChan chan struct{}
+}
 ```
+
+Core behaviors:
+
+- `Set()` inserts into the map and the heap
+- updating an existing key refreshes the heap entry with `heap.Fix`
+- `Get()` checks expiration from the map entry
+- cleanup repeatedly pops the earliest-expiring heap entries
+- cleanup stops as soon as the heap root is not expired
+- cleanup removes at most `k` expired items per tick, where `k` is configurable
+
+This is a fundamentally different expiration strategy from the naive version.
 
 ---
 
-## Latency Percentiles During Cleanup
+## Complexity
 
-### k=100 (15 µs lock hold)
-
-| Percentile | Latency |
+| Operation | Complexity |
 |---|---|
-| p50 | < 1 µs |
-| p95 | ~10 µs |
-| p99 | ~15 µs |
-| p99.9 | ~15 µs |
+| `Get` | `O(1)` average |
+| `Set` new | `O(log n)` |
+| `Set` update | `O(log n)` |
+| `Delete` | `O(log n)` |
+| `deleteExpired(k)` | `O(k log n)` |
+| `Len` | `O(1)` |
 
-### k=50K (6 ms lock hold)
+This is the core algorithmic win:
 
-| Percentile | Latency |
-|---|---|
-| p50 | ~3 ms |
-| p95 | ~5.5 ms |
-| p99 | ~6 ms |
-| p99.9 | ~6 ms |
+- naive cleanup: `O(n)` over the entire cache
+- heap cleanup: `O(k log n)` over only the expired prefix
 
-Both are **effectively invisible** to callers compared to the unoptimized 2.1 second stall.
+In other words, the heap changes expiration work from **full scan** to **ordered incremental drain**.
 
 ---
 
-## Stale Memory Accumulation
+## What the Heap Optimizes
 
-```
-TTL = 60s, 21M entries, uniform expiry distribution
-Expiry rate  =  350K entries/sec
+The heap does **not** make the ordinary write path cheaper.
 
-At 100ms cleanup interval (k=50K):
-  entries expired between sweeps  =  350K × 0.1s  =  35,000
-  stale memory                    =  35K × 1,184 bytes  =  ~40 MB
+In fact, it makes writes more expensive because every insert or TTL refresh must maintain heap order.
 
-Compare to unoptimized at 45s interval:
-  stale memory                    =  ~11 GB
-```
+What it improves is expiration cleanup:
 
-The heap reduces stale memory accumulation from **~11 GB to ~40 MB** between cleanup cycles.
+### Naive version
+- scan all items
+- remove the expired ones you find
+- cost depends on total cache size
 
----
+### Heap version
+- inspect the oldest expiration first
+- stop immediately if that item is still alive
+- remove expired items in time order
+- cost depends mostly on how many expired items are actually drained
 
-## CPU Utilization
-
-```
-1 goroutine doing all work  →  1 core at ~100%
-7 remaining cores           →  completely idle
-Effective utilization       →  12.5% of 8 vCPUs
-```
-
-The single mutex means utilization is identical to the unoptimized version during normal operation. Sharding across N independent mutexes is the next step to utilize remaining cores.
+That is why the heap version scales better for large TTL caches.
 
 ---
 
-## Effective Uptime
+## Memory Cost
 
-```
-Cleanup lock hold (k=50K)  =  6 ms every 100ms tick
-Frozen fraction            =  6ms / 100ms  =  6%  ← during cleanup only
-                                                      normal ops resume instantly after
+The heap-based cache pays more metadata per entry than the naive one.
 
-Unoptimized equivalent:
-  2.1s / 45s interval  =  4.7% frozen — but for 2.1 continuous seconds
-```
+Additional costs include:
 
-| Metric | Min-Heap k=50K | Unoptimized |
-|---|---|---|
-| Lock hold per cycle | 6 ms | 2.1 s |
-| Cycle interval | 100 ms | 45 s |
-| Frozen fraction | 6% of 100ms window | 4.7% of 45s window |
-| Max single stall | **6 ms** | **2.1 seconds** |
+- `cacheEntry` grows from about `40` to about `48` bytes
+- each item gets a separate `heapEntry` object, about `48` bytes
+- the heap slice stores one pointer per item
+- the map stores `*cacheEntry` instead of inline `cacheEntry`
 
-The fractions look similar but the **shape** is completely different: 6 ms blips every 100 ms vs a 2.1 second hard freeze every 45 seconds.
+So compared with the naive version:
 
----
+- metadata overhead is higher
+- capacity is lower by some percentage
+- the smaller the payload, the more visible this overhead becomes
 
-## Full Profile Summary
+With `1 KB` values, the extra metadata is usually acceptable.
+With very small values, the metadata tax becomes much harder to justify.
 
-| Metric | Value |
-|---|---|
-| Entries in 32 GB | ~21M |
-| Bytes per entry | ~1,184 bytes |
-| Capacity vs unoptimized | −3% |
-| Get throughput (avg) | ~13M/s |
-| Set new throughput (avg) | ~3.7M/s |
-| Set update throughput (avg) | ~7.1M/s |
-| 80/20 mix throughput | ~10.5–11.5M/s |
-| Heap depth | ~25 levels |
-| Cleanup lock hold (k=100) | **~15 µs** |
-| Cleanup lock hold (k=50K) | **~6 ms** |
-| Stale memory between sweeps | **~40 MB** |
-| p99 latency during cleanup | **~6 ms** (k=50K) |
-| Max single stall | **6 ms** |
-| Effective uptime | **~99.99%** |
-| CPU utilization | 12.5% (1 of 8 cores) |
-| Time frozen per hour | **~3.6 seconds** |
+A reasonable planning conclusion is:
+
+- the heap design gives up some memory density to gain much better expiration behavior
 
 ---
 
-## Key Takeaway
+## The Main Operational Requirement
 
-The heap does **not** improve steady-state throughput for `Get` or new `Set` — the bottleneck there is map access and memory allocation, unaffected by the heap. The decisive wins are:
+Main operational requirement:
 
-- **Cleanup stall**: 2.1 seconds → 6 ms (350× reduction)
-- **Stale memory**: ~11 GB → ~40 MB between sweeps (275× reduction)
-- **Update Set**: ~78 ns vs ~215 ns (heap.Fix beats delete+reinsert)
-- **Time frozen per hour**: 168 seconds → 3.6 seconds
+- cleanup throughput must be at least as high as expiration throughput
 
-You give up ~3% capacity (48 extra bytes per entry for `heapEntry`) to gain these improvements. It is an unambiguous trade.
+So the practical question is this:
+
+- "what values of `k` and `cleanupInterval` are sufficient for this workload?"
+
+Assume:
+
+- `~21M` items
+- `TTL = 60s`
+
+Then the average expiration rate is:
+
+```text
+21M / 60s ≈ 350K expired items per second
+```
+
+To keep up, cleanup must satisfy:
+
+```text
+k / interval >= 350K evictions per second
+```
+
+Examples:
+
+- `k=100`, `interval=100ms` => `1,000 evictions/sec`
+- `k=1_000`, `interval=100ms` => `10,000 evictions/sec`
+- `k=10_000`, `interval=100ms` => `100,000 evictions/sec`
+- `k=50_000`, `interval=100ms` => `500,000 evictions/sec`
+
+So for this example workload:
+
+- the first three settings fall behind
+- `k=50_000` with `100ms` cleanup interval is large enough to keep up
+
+The real caveat is configuration here:
+
+- too-small `k` causes stale-entry backlog growth
+- too-large `k` increases per-tick lock hold time
+- too-long cleanup interval increases stale-memory peaks
+- too-short cleanup interval increases scheduler and timer overhead
+
+---
+
+## Concurrency Trade-Off
+
+That has a major consequence:
+
+- cleanup also blocks all other operations while it holds the lock
+
+So compared with the naive version:
+
+- cleanup behavior is much better
+
+---
+
+## Stale Data Behavior
+
+The heap reduces stale data only if cleanup throughput is high enough.
+
+
+The heap makes stale-data accumulation controllable, when (that's important) cleanup capacity exceeds expiry rate
+
+---
+
+## Write-Path Trade-Off
+
+Compared with the naive version:
+
+### New insert
+- slower, because it updates the heap
+
+### Existing-key update
+- also slower, because it must call `heap.Fix`
+
+### Delete
+- supported explicitly and efficiently through `heap.Remove`
+
+This is an important correction to a common intuition: the heap version is not “faster overall.” It is faster specifically at expiration management.
+
+---
+
+## Operational Picture
+
+The optimized version is best understood as a rebalancing of costs.
+
+It moves the design from this profile:
+
+- cheap writes
+- expensive global cleanup
+
+to this one:
+
+- more expensive writes
+- incremental expiration cleanup
+
+That is usually the right trade-off for large caches, because global scans are much harder to scale than `log n` maintenance on the write path.
+
+---
+
+## When This Design Works Well
+
+This version is a good fit when:
+
+- the cache is large
+- expiration behavior matters
+- long cleanup pauses are unacceptable
+- the workload can tolerate extra write-path overhead
+- cleanup capacity is provisioned correctly
+
+It is a weaker fit when:
+
+- values are tiny and metadata overhead matters a lot
+- the workload is heavily read-concurrent
+- the implementation is not sharded
+- `k` and cleanup interval are tuned too conservatively for the churn rate
+
+---
+
+## Final Takeaway
+
+The min-heap cache is a better expiration algorithm than the naive cache.
+
+Its strengths are:
+
+- no full-cache expiration scan
+- cleanup tied to expired items instead of total cache size
+- incremental and predictable eviction behavior
+
+Its costs are:
+
+- more metadata per entry
+- slower `Set()`, especially updates
+- eviction throughput still has to be tuned correctly for the workload
+
+So the right conclusion is not that the heap version is simply “faster.” The right conclusion is:
+
+> the heap version spends more work on each write so that expiration stops being a full-cache event
+
+That is usually the better engineering trade-off for large TTL caches, especially once eviction capacity and concurrency strategy are tuned properly.

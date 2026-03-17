@@ -1,266 +1,275 @@
-# Naive TTL Cache — Performance Analysis
-### 1 Goroutine / 8 vCPU AWS (c6i.2xlarge) / 32 GB RAM / 1 KB Values
+# Naive TTL Cache in Go
+### Simple design, cheap steady-state operations, expensive cleanup
+
+This document analyzes the naive TTL cache implementation from `naive/cache.go`.
 
 ---
 
-## AWS Instance Baseline
+## Implementation
 
-| Property | Value |
-|---|---|
-| vCPUs | 8 (c6i.2xlarge / m6i.2xlarge) |
-| L1 cache | 48 KB per core |
-| L2 cache | 1.25 MB per core |
-| L3 cache | 30–40 MB shared |
-| Memory bandwidth | ~50 GB/s (DDR4-3200) |
-| Core clock | ~3.5 GHz base / ~3.9 GHz boost |
+The cache stores each item directly in a Go map and periodically scans the entire map to remove expired entries.
 
----
-
-## Memory Layout Per Entry
-
-```
+```go
 type cacheEntry struct {
-    value     any       → 16 bytes (interface header) + 1024 bytes (payload)
-    expiresAt time.Time → 24 bytes
+    value     any
+    expiresAt time.Time
 }
 
-map[string]*cacheEntry overhead:
-├── map bucket overhead  →    8 bytes
-├── string key header    →   16 bytes
-├── string key data      →   16 bytes avg
-└── *cacheEntry pointer  →    8 bytes
-
-cacheEntry struct        →   40 bytes  (without payload)
-value payload            → 1024 bytes
-
-Total per entry          → 1,112 bytes  ≈ 1.1 KB
+type TTLCache struct {
+    mu       sync.RWMutex
+    items    map[string]cacheEntry
+    ttl      time.Duration
+    stopChan chan struct{}
+}
 ```
 
-No `heapEntry` overhead — the unoptimized version has no heap.
+Core behaviors:
+
+- `Set()` inserts or overwrites a map entry
+- `Get()` checks expiration at read time
+- expired items remain in memory until background cleanup runs
+- `deleteExpired()` scans the full map under the write lock
+
+That last point defines the entire performance profile of this design.
 
 ---
 
-## Capacity at 32 GB
+## Complexity
 
-```
-32 GB × 0.75 usable  =  24 GB
-24 GB / 1,112 bytes  =  ~21.5M entries
-```
-
-Working number: **~21M entries**.
-
----
-
-## Operation Latencies — Single Goroutine
-
-With 1 goroutine there is no mutex contention. Lock cost is a single uncontested atomic CAS (~5–8 ns).
-
-### Get
-
-```
-sync.Mutex.Lock()   (uncontested CAS)  →   5–8 ns
-map bucket hash + lookup               →  30–50 ns
-*cacheEntry pointer deref              →  10–40 ns  (L1 hit → L3 miss depending on recency)
-time.Now()                             →   8–10 ns
-expiresAt compare                      →   2 ns
-sync.Mutex.Unlock()                    →   3–5 ns
-────────────────────────────────────────────────────
-total best  (L1 hot)                   →  ~58 ns
-total avg   (L2/L3)                    →  ~80 ns
-total worst (cold L3 miss)             → ~115 ns
-```
-
-### Set — New Key
-
-```
-sync.Mutex.Lock()                      →   5–8 ns
-time.Now() + add TTL                   →  10 ns
-map hash + bucket find                 →  30–50 ns
-go runtime malloc ~1 KB                →  50–100 ns
-map insert + possible rehash           →  30–80 ns
-sync.Mutex.Unlock()                    →   3–5 ns
-────────────────────────────────────────────────────
-total best                             → ~128 ns
-total avg                              → ~215 ns
-total worst (rehash triggered)         → ~300 ns
-```
-
-### Set — Existing Key Update
-
-```
-sync.Mutex.Lock()                      →   5–8 ns
-map lookup                             →  30–50 ns
-overwrite value + expiresAt            →  10–15 ns
-sync.Mutex.Unlock()                    →   3–5 ns
-────────────────────────────────────────────────────
-total best                             →  ~48 ns
-total avg                              →  ~78 ns
-```
-
-> Update is deceptively fast here — there is no heap to fix. The cost is deferred entirely to cleanup time, where the full map scan must process every entry regardless of whether it has expired.
-
----
-
-## Throughput — Single Goroutine
-
-| Operation | Best | Avg | Worst |
-|---|---|---|---|
-| Get | ~17M/s | ~12.5M/s | ~8.7M/s |
-| Set new | ~7.8M/s | ~4.6M/s | ~3.3M/s |
-| Set update | ~20M/s | ~12.8M/s | — |
-| 80/20 read/write (new keys) | ~14M/s | ~10M/s | ~7M/s |
-| 80/20 read/write (updates) | ~17M/s | ~12.5M/s | — |
-
----
-
-## Cleanup Cycle — The Full Cost
-
-### Why Iteration Is Slow at Scale
-
-```
-Individual Get:
-  accesses 1 specific key → likely warm in L1/L2 if recently used
-  pointer deref            → ~10–15 ns (L1 hit)
-
-Cleanup range iteration:
-  walks ALL map buckets sequentially
-  21M entries × pointer deref to random heap addresses
-  working set = 21M × 40 bytes (struct header) = ~840 MB
-  far exceeds L3 cache (30–40 MB)
-  almost every deref is a cold L3 miss → 40–80 ns each
-  prefetcher cannot help: pointers scatter across heap
-```
-
-### Scan Time at 21M Entries
-
-```
-Per-entry cost breakdown during range:
-  map bucket pointer walk    →  15–20 ns
-  *cacheEntry deref (L3 miss)→  40–80 ns
-  time.Now().After() compare →   2–5 ns
-  delete(map, key) amortized →  20–40 ns  (only for expired entries)
-  ────────────────────────────────────────
-  avg per entry              →  ~80–145 ns
-
-21M × 80 ns   =  1.68 s  (optimistic)
-21M × 100 ns  =  2.10 s  (realistic)
-21M × 145 ns  =  3.05 s  (pessimistic, fully cold L3)
-```
-
-Realistic lock hold per cleanup cycle: **~2.1 seconds**.
-
----
-
-## Effective Uptime at Various Cleanup Intervals
-
-With 1 goroutine, no operations are served during the scan — the goroutine is fully blocked inside `deleteExpired`.
-
-```
-frozen fraction  =  scan time / cleanup interval
-
-2.1s / 60s   =  3.5%  frozen
-2.1s / 45s   =  4.7%  frozen
-2.1s / 30s   =  7.0%  frozen
-2.1s / 10s   = 21.0%  frozen  ← severe
-```
-
-| Cleanup interval | Scans/hour | Frozen/hour | Effective uptime |
-|---|---|---|---|
-| 10s | 360 | 756s (12.6 min) | 79.0% |
-| 30s | 120 | 252s (4.2 min) | 93.0% |
-| **45s** | **80** | **168s (2.8 min)** | **95.3%** |
-| 60s | 60 | 126s (2.1 min) | 96.5% |
-| 120s | 30 | 63s | 98.3% |
-| 300s | 12 | 25s | 99.3% |
-
-Every reduction in interval to reclaim memory faster **directly cuts into availability**.
-
----
-
-## Stale Memory Accumulation
-
-```
-TTL = 60s, 21M entries uniform distribution
-Expiry rate  =  21M / 60s  =  350K entries/sec expire
-
-At 45s cleanup interval:
-  entries expired before sweep  =  350K × 45  =  15.75M stale entries
-  stale memory                  =  15.75M × 1,112 bytes  =  ~17.5 GB
-
-At 60s cleanup interval:
-  stale entries                 =  350K × 60  =  21M  (entire cache expired)
-  stale memory                  =  ~23.4 GB   → nearly full 32 GB used by dead entries
-
-At 120s cleanup interval:
-  stale entries                 =  350K × 120  =  42M  → exceeds 21M capacity
-  cache grows beyond 32 GB      → OOM crash
-```
-
-### Hard Constraint on Cleanup Interval
-
-```
-cleanup interval  MUST be  <  capacity / expiry_rate
-                           =  21M / 350K per sec
-                           =  60 seconds maximum
-
-At exactly 60s  → 100% of cache is stale just before sweep
-Safe target     → 30–45s keeps stale entries below 75%
-```
-
----
-
-## Latency Percentiles During Cleanup
-
-With a single goroutine the next operation after cleanup starts waits for the **entire scan to finish**:
-
-| Request timing | Wait time |
+| Operation | Complexity |
 |---|---|
-| Arrives at start of scan | ~2.1 s |
-| Arrives halfway through | ~1.05 s |
-| Arrives near end of scan | ~0.1 s |
-| **p50** | **~1.05 s** |
-| **p95** | **~1.99 s** |
-| **p99** | **~2.08 s** |
-| **p99.9** | **~2.10 s** |
+| `Get` | `O(1)` average |
+| `Set` | `O(1)` average |
+| `deleteExpired` | `O(n)` |
+| `Stop` | `O(1)` |
+
+The cache is fast on ordinary reads and writes, but expiration cleanup cost grows linearly with the total number of cached items.
 
 ---
 
-## CPU Utilization
+## Why This Version Is Attractive
 
+This implementation has real advantages:
+
+- minimal code
+- easy to reason about
+- no secondary index to maintain
+- cheap updates to existing keys
+- good concurrent-read behavior in steady state because it uses `sync.RWMutex`
+
+An update is especially cheap here: overwrite the map value and refresh `expiresAt`. There is no heap fix-up, no delete-reinsert, and no extra structure to synchronize.
+
+For small and medium caches, this simplicity is often worth a lot.
+
+---
+
+## Memory Shape
+
+The in-struct metadata is small:
+
+```go
+type cacheEntry struct {
+    value     any       // 16 bytes on 64-bit Go
+    expiresAt time.Time // 24 bytes
+}
 ```
-1 goroutine doing all work  →  1 core at ~100%
-7 remaining cores           →  completely idle
-Effective utilization       →  12.5% of 8 vCPUs
+
+That makes the struct itself roughly:
+
+- `40 bytes` on a 64-bit Go runtime
+
+But total per-entry memory is larger because the cache also pays for:
+
+- map bucket overhead
+- string key header
+- key bytes
+- allocator size classes
+- map growth slack
+- the concrete value stored behind `any`
+
+If you assume:
+
+- average key size: `16 bytes`
+- average value payload: `1024 bytes`
+
+then a realistic rough planning number is:
+
+- about `1.1 KB` to `1.2 KB` per entry total
+
+That estimate is good enough for capacity planning, even though the exact number varies by workload and Go runtime details.
+
+---
+
+## Capacity on a 32 GiB Node
+
+Using a conservative 75% memory budget for the cache:
+
+```text
+32 GiB × 0.75 = 24 GiB usable
+24 GiB / 1.1 KB ≈ 21M entries
 ```
 
-This is identical during both normal operation and cleanup — the machine is paid for but 7 of 8 cores sit unused.
+So a reasonable planning number is:
+
+- `~20M to 21M` entries on a `32 GiB` machine with `1 KB` values
+
+This is only a memory-capacity estimate. It does not mean the cache will behave well operationally at that size.
 
 ---
 
-## Full Profile Summary
+## The Real Cost: Full-Map Cleanup
 
-| Metric | Value |
-|---|---|
-| Entries in 32 GB | ~21M |
-| Bytes per entry | ~1,112 bytes |
-| Get throughput (avg) | ~12.5M/s |
-| Set new throughput (avg) | ~4.6M/s |
-| Set update throughput (avg) | ~12.8M/s |
-| 80/20 mix throughput | ~10–12.5M/s |
-| Cleanup scan time | **~2.1 seconds** |
-| Minimum safe interval | 30–45s |
-| Stale memory at 45s interval | **~17.5 GB** (54% of RAM) |
-| p50 latency during cleanup | **~1.05 s** |
-| p99 latency during cleanup | **~2.08 s** |
-| Max single stall | **~2.1 seconds** |
-| Effective uptime at 45s interval | **~95.3%** |
-| CPU utilization | 12.5% (1 of 8 cores) |
-| Time frozen per hour | **~168 seconds** |
+The cleanup path is the weakness:
+
+```go
+func (c *TTLCache) deleteExpired() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    now := time.Now()
+    for k, v := range c.items {
+        if now.After(v.expiresAt) {
+            delete(c.items, k)
+        }
+    }
+}
+```
+
+Properties of this cleanup strategy:
+
+- it acquires the write lock
+- it blocks all readers and writers
+- it scans every entry
+- it does the same scan even if very few items are expired
+
+This means cleanup cost depends on **cache size**, not on **number of expired items**.
+
+That is the central scalability limitation of the naive design.
 
 ---
 
-## Key Takeaway
+## Concurrency Behavior
 
-With a single goroutine and 21M entries at 1 KB values, the unoptimized cache spends **~168 seconds of every hour completely frozen** — not degraded, not slow, but returning zero responses — while holding **~17.5 GB of RAM in expired entries** that cannot be reclaimed until the next sweep.
+This implementation uses `sync.RWMutex`, which gives it a useful steady-state property:
 
-The root cause is that `deleteExpired` performs a full O(n) scan regardless of how many entries have actually expired. With 21M entries scattered across ~840 MB of heap memory, the CPU cache miss rate approaches 100% during iteration, making every cleanup cycle a guaranteed multi-second stall.
+- many `Get()` calls can run concurrently
+- `Set()` requires exclusive access
+- cleanup blocks everything because it takes the write lock
+
+So in read-heavy workloads, the naive version can actually outperform more sophisticated designs during normal operation.
+
+The problem appears when cleanup starts. At that moment:
+
+- all readers stop
+- all writers stop
+- the cache remains unavailable until the scan finishes
+
+In other words, average-case concurrency is decent, but tail latency is dominated by cleanup pauses.
+
+---
+
+## Stale Data and Memory Retention
+
+Expired entries are not removed immediately on `Get()`. They are only observed as expired and treated as misses.
+
+That means dead entries can remain in memory until the next cleanup pass.
+
+Assume:
+
+- `TTL = 60s`
+- `~21M` entries
+- roughly uniform expiration distribution
+
+Then the average expiry rate is:
+
+```text
+21M / 60s ≈ 350K expired entries per second
+```
+
+If cleanup runs every `45s`, then just before the next sweep the cache may contain roughly:
+
+```text
+350K × 45 ≈ 15.75M expired entries
+```
+
+At about `1.1 KB` each, that is roughly:
+
+- `~17 GB` of stale memory
+
+That is a peak-before-sweep estimate, not a constant-state average, but it shows the trade-off clearly: the cache retains expired data to keep `Set()` simple.
+
+---
+
+## Operational Impact at Large Scale
+
+For small caches, a full scan is cheap enough.
+
+For very large caches, the picture changes:
+
+- cleanup time grows with total entry count
+- the write lock is held for the whole scan
+- latency spikes become proportional to cleanup duration
+- the more often cleanup runs, the lower the stale-memory backlog, but the more often the cache pauses
+
+This creates a tension between:
+
+- memory freshness
+- latency stability
+- cleanup frequency
+
+You can reclaim memory faster by sweeping more often, but every sweep still blocks the entire cache.
+
+---
+
+## Performance Framing
+
+It is tempting to describe this cache with nanosecond-level estimates for `Get()` and `Set()`, but the more honest framing is this:
+
+### Reads
+- usually fast
+- average-case `O(1)`
+- concurrent readers scale reasonably well between cleanup cycles
+
+### Writes
+- usually fast
+- average-case `O(1)`
+- updates are especially cheap
+
+### Expiration
+- the expensive part
+- `O(n)` under exclusive lock
+- becomes the dominant cost at large cache sizes
+
+So the naive implementation often looks excellent in microbenchmarks and disappointing in tail-latency charts.
+
+---
+
+## When This Design Works Well
+
+This cache is a good fit when:
+
+- the cache is not extremely large
+- occasional cleanup pauses are acceptable
+- the workload is read-heavy with modest churn
+- implementation simplicity matters more than perfect expiration behavior
+
+It is a poor fit when:
+
+- the cache holds tens of millions of items
+- tight latency SLOs matter
+- expired data must be reclaimed quickly
+- cleanup pauses are operationally unacceptable
+
+---
+
+## Final Takeaway
+
+The naive TTL cache is a strong baseline because it is:
+
+- simple
+- compact
+- easy to maintain
+- fast for ordinary reads and writes
+
+Its weakness is not lookup speed. Its weakness is expiration strategy.
+
+Because cleanup scans the entire map under the write lock, the cost of expiration grows with total cache size rather than with the number of expired items. That makes the design easy to implement, but hard to scale cleanly once the cache becomes very large.

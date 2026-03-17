@@ -57,9 +57,9 @@ type cacheEntry struct {
 // -------------------------------------------------------
 
 type TTLCache struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	items    map[string]*cacheEntry
-	k        int // max evictions per cleanup cycle
+	k        int
 	h        expiryHeap
 	ttl      time.Duration
 	stopChan chan struct{}
@@ -106,9 +106,8 @@ func (c *TTLCache) Set(key string, value any) {
 
 // Get returns the value if present and not expired.
 func (c *TTLCache) Get(key string) (any, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	entry, ok := c.items[key]
 	if !ok || time.Now().After(entry.expiresAt) {
 		return nil, false
