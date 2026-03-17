@@ -222,7 +222,40 @@ You can reclaim memory faster by sweeping more often, but every sweep still bloc
 
 ## Performance Framing
 
-It is tempting to describe this cache with nanosecond-level estimates for `Get()` and `Set()`, but the more honest framing is this:
+Baseline: iteration cost per entry
+```
+map range + time.Now().After()  check  ~50–80 ns  (hot cache, small map)
+map range + pointer deref       L3 miss ~100–150 ns (cold, large map)
+
+We use 100 ns/entry as the realistic average for large maps.
+```
+
+Raw scan time at scale:
+| Items     | Time @ 50ns | Time @ 100ns | Time @ 150ns |
+|-----------|-------------|--------------|--------------|
+| 1M        | 50 ms       | 100 ms       | 150 ms       |
+| 10M       | 500 ms      | 1 s          | 1.5 s        |
+| 50M       | 2.5 s       | 5 s          | 7.5 s        |
+| 100M      | 5 s         | 10 s         | 15 s         |
+| 120M ← 32GB | 6 s       | 12 s         | 18 s         |
+| 500M      | 25 s        | 50 s         | 75 s         |
+| 1B        | 50 s        | 100 s        | 150 s        |
+
+
+What 12 seconds of lock means for throughput:
+At 120M items (32 GB), every cleanup cycle holds mu.Lock() for ~12 seconds. During that window:
+
+```aiignore
+Get()  →  blocks, waits 12s       effectively 0 ops/sec
+Set()  →  blocks, waits 12s       effectively 0 ops/sec
+```
+If cleanup runs every 1 second:
+```aiignore
+duty cycle  =  12s lock / 1s interval  =  1200%  ← impossible, runs continuously
+```
+The cleanup never finishes before the next tick fires. The cache deadlocks itself — the goroutine is perpetually inside deleteExpired, and all callers queue behind the mutex forever.
+
+
 
 ### Reads
 - usually fast
@@ -238,8 +271,6 @@ It is tempting to describe this cache with nanosecond-level estimates for `Get()
 - the expensive part
 - `O(n)` under exclusive lock
 - becomes the dominant cost at large cache sizes
-
-So the naive implementation often looks excellent in microbenchmarks and disappointing in tail-latency charts.
 
 ---
 

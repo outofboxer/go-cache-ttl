@@ -221,6 +221,29 @@ That is usually the right trade-off for large caches, because global scans are m
 
 ---
 
+## Performance in absolute time
+
+The heap version carries extra scaffolding (144 bytes vs ~112 bytes without heap), so it fits slightly fewer entries:
+
+| Metric                        | Unoptimized              | Heap k=100k          |
+|-------------------------------|--------------------------|----------------------|
+| Entries in 32 GB              | ~22M                     | ~21.6M               |
+| Cleanup lock hold             | 3.3 seconds              | ~500 µs              |
+| Cleanup interval needed       | 10s                      | 100ms                |
+| Stale accumulation            | ~3.67M entries / 4.2 GB  | ~10K entries / 11 MB |
+| p99 latency during cleanup    | 3.3 s                    | < 1 ms               |
+| Capacity cost of optimization | —                        | ~2% fewer entries    |
+
+```aiignore
+The heap version carries extra scaffolding (144 bytes vs ~112 bytes without heap), so it fits slightly fewer entries:
+```
+
+
+
+You give up ~400K entries (~2%) to gain a 6,600× reduction in lock hold time. At 1 KB values that's an easy trade.
+
+--- 
+
 ## When This Design Works Well
 
 This version is a good fit when:
