@@ -1,133 +1,259 @@
-Copyright (c) 2026 Oleg Klimenko
+Required background to understand this article.
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+To understand this article, one needs to understand a few Min-Heap data structure nuances.
+If you already know how a Min-Heap works, feel free to skip this section.
 
-The copyright allows anyone to freely use, modify, and distribute the software, but they must keep the original copyright notice (my name) in the source and any substantial portions. 
+------
 
-# go-cache-ttl
-This repo is for my articles about cache optimization using Golang
-
-
-Naive (Simple TTL) implementation calculation
-
-Let's calculate using an AWS compute server m6i.2xlarge with 8 vCPU and 32 GiB RAM.
-
-Memory usage.
-
-Memory per entry:
+1. Heap Property
+   For each node `i`:
 ```
-type cacheEntry struct {
-value     any       → 16 bytes (interface header) + 1024 bytes (payload)
-expiresAt time.Time → 24 bytes
+value(parent(i)) ≤ value(i)
+```
+As a conclusion, the smallest element is always at the root.
+
+2. Complete Binary Tree
+   A heap is stored as a **complete binary tree**, meaning:
+- All levels are fully filled except possibly the last.
+- The last level is filled **from left to right**.
+
+
+The heaps are usually stored in a **compact array representation** rather than pointer-based trees.
+
+For node index `i`:
+```
+parent = (i - 1) / 2
+left   = 2*i + 1
+right  = 2*i + 2
+```
+
+Conclusion: Peek - reading the smallest element is O(1).
+
+Overall, the complexity of core operations in a Min-Heap:
+
+|Operation|Description|Complexity|
+|---|---|---|
+|`Peek()`|Read smallest element|**O(1)**|
+|`Push()`|Insert element and restore heap property|**O(log n)**|
+|`Pop()`|Remove smallest element|**O(log n)**|
+|`Fix()`|Update element priority and rebalance|**O(log n)**|
+![[Pasted image 20260315215525.png]]
+
+We get a **Max-Heap** if we reverse the condition in Heap Property #1 above.
+
+End of required background.
+
+
+------
+
+
+Now, let me start with my Big Data problem and how this Min-Heap data structure is useful here.
+I was building an in-memory cache in Golang for a big data solution. The dedicated server had to handle millions of cache items, and had 32 GB RAM, Linux, and 8 virtual CPUs.
+
+At first, I created a classical TTL cache. Its full implementation is in my GitHub (https://github.com/outofboxer/go-cache-ttl/blob/main/naive/cache.go); here I just show the bottleneck, which is periodic item cleanup based on expiration time, like this:
+```
+// cleanup runs a ticker that purges expired entries 
+
+type cacheEntry struct { 
+	value any 
+	expiresAt time.Time 
+} 
+type TTLCache struct { 
+	mu sync.RWMutex 
+	items map[string]cacheEntry 
+	ttl time.Duration 
+	stopChan chan struct{} 
+}
+
+// this is run periodically in a goroutine
+func (c *TTLCache) deleteExpired() 
+{ 
+	c.mu.Lock() 
+	defer c.mu.Unlock() 
+	
+	now := time.Now() 
+	
+	for k, v := range c.items { 
+		if now.After(v.expiresAt) { 
+			delete(c.items, k) 
+		} 
+	} 
+}
+
+```
+
+The `deleteExpired` function iterates over map items, so it's O(N) in the map's length.
+
+I have detailed calculations in my GitHub repo; here are the main points.
+
+**Full summary: 8 vCPU AWS / 32 GB / 1 KB values / unoptimized:**
+
+| Metric                    | Value            |
+| ------------------------- | ---------------- |
+| Entries in 32 GB          | ~21M             |
+| Get latency               | ~80 ns           |
+| Set latency               | ~300 ns          |
+| CPU utilization           | ~12% of 8 vCPUs  |
+| Cleanup lock hold         | **~3.3 seconds** |
+| Throughput during cleanup | **zero**         |
+| Effective core usage      | **~1 of 8**      |
+For calculations, see my GitHub analysis for this implementation: https://github.com/outofboxer/go-cache-ttl/blob/main/docs/naive-analysis.md
+
+So, for 20 million cache items with 1 KB values each, we get a useless cache stuck for 3 seconds during each cleanup.
+
+Sure thing, sharding per CPU could help. But let's consider using something more clever, namely involving a min-heap data structure.
+
+Why should this help? Because of this chart. Min-heap has O(log n) complexity, and for millions of items the comparison with O(n) looks significant:
+
+![[Pasted image 20260315221320.png]]
+
+
+But there is no free meal: we need to combine a min-heap with a hashmap. So, I did it like below.
+
+
+```
+
+type heapEntry struct {  
+    key       string  
+    expiresAt time.Time  
+    index     int // maintained by heap.Interface for O(log n) updates
+}
+
+type expiryHeap []*heapEntry // this is Min-Heap
+
+type cacheEntry struct {  
+    value     any  
+    expiresAt time.Time  
+    heapNode  *heapEntry // pointer back to heap node for O(log n) re-heap on update  
+}
+
+// deleteExpired pops at most k expired entries from the heap. 
+// Holding the lock only long enough to drain the k oldest entries 
+// avoids a full map scan and caps the critical section. 
+func (c *TTLCache) deleteExpired(k int) { 
+	c.mu.Lock() 
+	defer c.mu.Unlock() 
+	now := time.Now() 
+	removed := 0 
+	for c.h.Len() > 0 && removed < k { 
+		top := c.h[0] // peek — O(1) 
+		if now.Before(top.expiresAt) { 
+			break // everything else expires later — heap guarantee 
+		} 
+		heap.Pop(&c.h) 
+		delete(c.items, top.key) 
+		removed++ 
+	} 
 }
 ```
 
+Besides, Get and Set become a bit more complex:
 ```
-map[string]*cacheEntry:
-├── map bucket overhead  →   8 bytes
-├── string key header    →  16 bytes
-├── string key data      →  16 bytes avg
-└── *cacheEntry pointer  →   8 bytes
+// Set inserts or updates a key. On update the heap node is fixed in O(log n).
+func (c *TTLCache) Set(key string, value any) {  
+    c.mu.Lock()  
+    defer c.mu.Unlock()  
+  
+    newExpiry := time.Now().Add(c.ttl)  
+  
+    if existing, ok := c.items[key]; ok {  
+       // Update value and refresh expiry in-place — O(log n) heap fix  
+       existing.value = value  
+       existing.expiresAt = newExpiry  
+       existing.heapNode.expiresAt = newExpiry  
+       heap.Fix(&c.h, existing.heapNode.index)  
+       return  
+    }  
+  
+    // New entry: push onto heap and record cross-pointer  
+    node := &heapEntry{key: key, expiresAt: newExpiry}  
+    heap.Push(&c.h, node)  
+    c.items[key] = &cacheEntry{  
+       value:     value,  
+       expiresAt: newExpiry,  
+       heapNode:  node,  
+    }  
+}  
+  
+// Get returns the value if present and not expired.
+func (c *TTLCache) Get(key string) (any, bool) {  
+    c.mu.Lock()  
+    defer c.mu.Unlock()  
+  
+    entry, ok := c.items[key]  
+    if !ok || time.Now().After(entry.expiresAt) {  
+       return nil, false  
+    }  
+    return entry.value, true  
+}
 ```
 
-cacheEntry struct        →  40 bytes (without payload)
-value payload            → 1024 bytes
+The cross-pointer `cacheEntry.heapNode` links the map entry back to its heap node. This is what makes O(log n) updates on `Set` possible — you don't search the heap for the key, you jump straight to its node.
 
-Total per entry          → 1,136 bytes  ≈ 1.1 KB
-No heapEntry overhead here — the unoptimized version has no heap.
+The heap array is a flat `[]*heapEntry` slice — sequential memory, much friendlier to the prefetcher than random map bucket traversal.
 
-Per entry:
-map bucket overhead    →    8 bytes
-string key header      →   16 bytes
-string key data        →   16 bytes
-*cacheEntry pointer    →    8 bytes
-cacheEntry struct      →   40 bytes
-value payload (1KB)    → 1024 bytes
-──────────────────────────────────
-total                  → 1,112 bytes  ≈ 1.1 KB
+**Throughput comparison — 1 goroutine:**
 
-32 GB × 0.75 usable = 24 GB
-24 GB / 1,112 bytes  = ~21.5M entries
-We'll use ~21M entries as the working number.
+|Operation|Unoptimized|Min-Heap|Delta|
+|---|---|---|---|
+|Get|~12–16M/s|~12–16M/s|same|
+|Set new|~3–5M/s|~3–5M/s|same|
+|Set update|~3–5M/s|~6–10M/s|**~2×**|
+|80/20 read-write|~10–13M/s|~10–14M/s|+5–10%|
 
+---
 
+**Latency percentiles during cleanup — 1 goroutine:**
 
+| Metric                | Unoptimized | Min-Heap k=100 | Min-Heap k=50K |
+| --------------------- | ----------- | -------------- | -------------- |
+| Cleanup pause         | **3.3 s**   | **15 µs**      | **6 ms**       |
+| Ops stalled per cycle | ~46M        | ~210           | ~84K           |
+| p50 during cleanup    | ~1.6 s      | < 1 µs         | ~3 ms          |
+| p99 during cleanup    | ~3.3 s      | ~15 µs         | ~6 ms          |
+| p99.9 during cleanup  | ~3.3 s      | ~15 µs         | ~6 ms          |
 
+**CPU utilization — 1 goroutine on 8 vCPU machine:**
 
-AWS instance baseline: 8 vCPU
-A typical 8 vCPU AWS instance (c6i.2xlarge / m6i.2xlarge) gives you:
-8 vCPUs        → 8 hardware threads (2 physical cores × 4 HT, or 4 cores × 2 HT)
-L1 cache       → 48 KB per core (data)
-L2 cache       → 1.25 MB per core
-L3 cache       → 30–40 MB shared across all cores
-Memory BW      → ~50 GB/s (DDR4-3200, dual channel)
-Core clock     → ~3.5 GHz base, ~3.9 GHz boost
+```
+1 goroutine doing all work  →  1 core at ~100%
+7 cores                     →  completely idle
+Effective utilization       →  12.5% of machine  (1 of 8 vCPUs)
+```
 
+Identical for both implementations — this is now purely a **single-threaded workload** on a machine built for parallelism.
 
-Operation latencies — broken down cycle by cycle:
-Get:
-sync.Mutex.Lock()   (uncontested CAS)  →   5–8 ns
-map bucket hash + lookup               →  30–50 ns
-*cacheEntry pointer deref              →  10–40 ns  (L1 hit → L3 miss depending on key age)
-time.Now()                             →   8–10 ns
-expiresAt compare                      →   2 ns
-sync.Mutex.Unlock()                    →   3–5 ns
-────────────────────────────────────────────────────
-total best  (L1 hot)                   →  ~58 ns
-total avg   (L2/L3)                    →  ~80 ns
-total worst (L3 miss, cold entry)      → ~115 ns
+---
 
+**Full summary — 1 goroutine / 8 vCPU AWS / 32 GB / 1 KB values:**
+More details at my GitHub: https://github.com/outofboxer/go-cache-ttl/blob/main/docs/minheap-analysis.md
 
+|Metric|Unoptimized|Min-Heap|
+|---|---|---|
+|Entries in 32 GB|~22M|~21M|
+|Get throughput|~12–16M/s|~12–16M/s|
+|Set new throughput|~3–5M/s|~3–5M/s|
+|Set update throughput|~3–5M/s|**~6–10M/s**|
+|80/20 mix throughput|~10–13M/s|~10–14M/s|
+|Cleanup pause|**~3.3 seconds**|**~15 µs**|
+|CPU utilization|12.5%|12.5%|
+|Cores actually used|1 of 8|1 of 8|
 
+---
 
-Set (new key):  
-sync.Mutex.Lock()                      →   5–8 ns
-time.Now() + add TTL                   →  10 ns
-map hash + bucket find                 →  30–50 ns
-go runtime malloc ~1KB                 →  50–100 ns
-map insert + possible rehash           →  30–80 ns
-sync.Mutex.Unlock()                    →   3–5 ns
-────────────────────────────────────────────────────
-total best                             → ~128 ns
-total avg                              → ~215 ns
-total worst (rehash triggered)         → ~300 ns
+**The honest picture at 1 goroutine:**
 
+The **only place the heap wins decisively is the cleanup pause** — cutting 3.3 seconds down to microseconds. For a single-goroutine workload that's still the critical result, because a 3.3 second stall every 60 seconds means roughly **5.5% of wall time the cache is completely frozen**.
 
-Set (existing key update):
-sync.Mutex.Lock()                      →   5–8 ns
-map lookup                             →  30–50 ns
-overwrite value + expiresAt            →  10–15 ns
-sync.Mutex.Unlock()                    →   3–5 ns
-────────────────────────────────────────────────────
-total best                             →  ~48 ns
-total avg                              →  ~78 ns
-Note: unoptimized update is faster than heap update because there's no heap.Fix — the cost shows up later at cleanup time instead.
+```
+Unoptimized:  3.3s pause / 60s TTL  =  5.5% of time frozen
+Min-heap k=100:  15µs / 100ms tick  =  0.015% of time frozen
+```
+
+Both implementations are leaving ~88% of the 8 vCPUs idle. That's the next problem to solve — and it points directly to the **sharded cache**.
 
 
-Cleanup cycle — the full cost:
-21M entries × 100 ns avg iteration cost:
 
-map range overhead per entry   →  15–20 ns  (bucket pointer walk)
-*cacheEntry deref              →  10–40 ns  (cache miss pattern)
-time.Now().After() compare     →   2–5 ns
-delete(map, key) when expired  →  20–40 ns  (amortized)
-──────────────────────────────────────────
-avg per entry                  →  ~80–105 ns
+This is an important correction to a common intuition: the heap version is not “faster overall.” It is faster specifically at expiration management.
 
-21M × 80 ns   =  1.68 s  (optimistic)
-21M × 100 ns  =  2.10 s  (realistic)
-21M × 150 ns  =  3.15 s  (pessimistic, cold L3 throughout)
-Realistic number: ~2.1 seconds lock held per cleanup cycle.
-
-Stall impact on the single goroutine:
-With 1 goroutine there's no queue of waiting callers — the goroutine itself is blocked inside cleanup. All ops simply stop for the duration:
-Cleanup runs every 60s (minimum safe interval for 2.1s scan):
-
-2.1s frozen / 60s cycle  =  3.5% of wall time fully stopped
-
-In a 1-hour window:
-60 cleanup cycles × 2.1s  =  126 seconds frozen
-3,600s total − 126s        =  3,474s serving
-effective uptime           =  96.5%
-If you tighten the interval trying to keep memory clean:
-
+Thanks for reading!
